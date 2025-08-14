@@ -1,0 +1,17 @@
+{
+  "cxxNamespace": ["nitrosharereceiver"],
+  "ios": {
+    "iosModuleName": "NitroShareReceiver"
+  },
+  "android": {
+    "androidNamespace": ["nitrosharereceiver"],
+    "androidCxxLibName": "nitrosharereceiver"
+  },
+  "autolinking": {
+    "NitroShareReceiver": {
+      "swift": "NitroShareReceiver",
+      "kotlin": "NitroShareReceiver"
+    }
+  },
+  "ignorePaths": ["node_modules"]
+}
