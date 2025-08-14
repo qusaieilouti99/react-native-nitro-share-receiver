@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-share-receiver",
-  "version": "0.1.4",
+  "version": "0.1.7",
   "description": "Put your app as receiving share target",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
