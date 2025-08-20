@@ -21,7 +21,10 @@ class ShareSingleton {
   /// State to ensure `INITIAL_SHARED_ITEMS` is only sent once per app lifecycle.
   private var hasSentInitialItems = false
 
-  // ADDITION: Darwin notification name
+  /// Track if Darwin observer is registered to prevent double registration
+  private var isDarwinObserverRegistered = false
+
+  // Darwin notification name
   private let darwinNotificationName = "com.yourapp.nitro.share.received"
 
   private init() {
@@ -39,32 +42,37 @@ class ShareSingleton {
       object: nil
     )
 
-    // ADDITION: Register for Darwin notification
+    // Register for Darwin notification
     registerForDarwinNotification()
   }
 
-  /// ADDITION: Register for Darwin notification
+  /// Register for Darwin notification with proper memory management
   private func registerForDarwinNotification() {
-    let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
-    let observer = Unmanaged.passUnretained(self).toOpaque()
+    guard !isDarwinObserverRegistered else { return }
 
+    let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
+
+    // Use a global callback function to avoid memory management issues
     CFNotificationCenterAddObserver(
       notificationCenter,
-      observer,
+      nil, // No observer object needed
       { (center, observer, name, object, userInfo) in
-        guard let observer = observer else { return }
-        let myself = Unmanaged<ShareSingleton>.fromOpaque(observer).takeUnretainedValue()
-        myself.handleDarwinNotification()
+        // Call the singleton method directly
+        ShareSingleton.shared.handleDarwinNotification()
       },
       darwinNotificationName as CFString,
       nil,
       .deliverImmediately
     )
+
+    isDarwinObserverRegistered = true
   }
 
-  /// ADDITION: Handle Darwin notification
+  /// Handle Darwin notification
   private func handleDarwinNotification() {
-    queue.async { self.checkForSharedData() }
+    queue.async {
+      self.checkForSharedData()
+    }
   }
 
   /// Registers a callback from JavaScript to listen for share events.
@@ -72,50 +80,91 @@ class ShareSingleton {
     let id = UUID().uuidString
     let newListener = Listener(id: id, callback: callback)
 
-    DispatchQueue.main.async { self.listeners.append(newListener) }
+    // Thread-safe listener addition
+    queue.async {
+      DispatchQueue.main.sync {
+        self.listeners.append(newListener)
+      }
 
-    // Check for data immediately upon listener registration.
-    queue.async { self.checkForSharedData() }
+      // Check for data immediately upon listener registration
+      self.checkForSharedData()
+    }
 
+    // Return cleanup function
     return { [weak self] in
-      DispatchQueue.main.async { self?.listeners.removeAll { $0.id == id } }
+      DispatchQueue.main.async {
+        self?.listeners.removeAll { $0.id == id }
+      }
     }
   }
 
   @objc private func appDidBecomeActive() {
-    queue.async { self.checkForSharedData() }
+    queue.async {
+      self.checkForSharedData()
+    }
   }
 
   /// Atomically reads, deletes, and processes shared data from UserDefaults.
   private func checkForSharedData() {
-    guard let appGroupId = self.appGroupId, let userDefaults = UserDefaults(suiteName: appGroupId) else { return }
-
-    userDefaults.synchronize()
-
-    guard let sharedData = userDefaults.array(forKey: self.userDefaultsKey) as? [[String: Any]], !sharedData.isEmpty else {
+    guard let appGroupId = self.appGroupId else {
+      print("⚠️ ShareSingleton: No app group ID configured")
       return
     }
 
+    guard let userDefaults = UserDefaults(suiteName: appGroupId) else {
+      print("⚠️ ShareSingleton: Cannot access UserDefaults with suite name: \(appGroupId)")
+      return
+    }
+
+    // Synchronize to ensure we have the latest data
+    userDefaults.synchronize()
+
+    // Read and immediately remove data atomically
+    guard let sharedData = userDefaults.array(forKey: self.userDefaultsKey) as? [[String: Any]],
+          !sharedData.isEmpty else {
+      return
+    }
+
+    // Remove data first to prevent duplicate processing
     userDefaults.removeObject(forKey: self.userDefaultsKey)
     userDefaults.synchronize()
 
+    // Process the shared items
     let sharedItems = sharedData.compactMap { self.createSharedItem(from: $0) }
-    guard !sharedItems.isEmpty else { return }
+    guard !sharedItems.isEmpty else {
+      print("⚠️ ShareSingleton: No valid shared items found")
+      return
+    }
 
+    // Determine event type
     let eventType: ShareEventType = self.hasSentInitialItems ? .sharedItems : .initialSharedItems
-    if !self.hasSentInitialItems { self.hasSentInitialItems = true }
+    if !self.hasSentInitialItems {
+      self.hasSentInitialItems = true
+    }
 
+    // Create event
     let eventData = ShareEventData(items: sharedItems, totalCount: Double(sharedItems.count))
     let event = ShareEvent(event: eventType, data: eventData)
 
+    // Dispatch to listeners on main thread
     DispatchQueue.main.async {
-      self.listeners.forEach { $0.callback(event) }
+      let currentListeners = self.listeners // Capture current listeners
+      currentListeners.forEach { listener in
+        do {
+          listener.callback(event)
+        } catch {
+          print("❌ ShareSingleton: Error calling listener \(listener.id): \(error)")
+        }
+      }
     }
   }
 
   private func createSharedItem(from dict: [String: Any]) -> SharedItem? {
     guard let typeString = dict["type"] as? String,
-          let type = ShareItemType(fromString: typeString) else { return nil }
+          let type = ShareItemType(fromString: typeString) else {
+      print("⚠️ ShareSingleton: Invalid or missing type in shared item: \(dict)")
+      return nil
+    }
 
     return SharedItem(
       type: type,
@@ -135,14 +184,6 @@ class ShareSingleton {
     )
   }
 
-    deinit {
-        let notificationCenter = CFNotificationCenterGetDarwinNotifyCenter()
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-        CFNotificationCenterRemoveObserver(
-            notificationCenter,
-            observer,
-            CFNotificationName(darwinNotificationName as CFString),
-            nil
-        )
-    }
+  // No deinit needed - singleton lives for app lifetime
+  // Darwin notifications will be cleaned up automatically when app terminates
 }
