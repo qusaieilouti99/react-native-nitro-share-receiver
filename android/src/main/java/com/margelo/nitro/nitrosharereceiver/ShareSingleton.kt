@@ -17,28 +17,41 @@ import java.util.concurrent.CopyOnWriteArrayList
 private data class Listener(val id: String, val callback: (event: ShareEvent) -> Unit)
 
 /**
- * A singleton class responsible for processing incoming share intents, extracting rich metadata,
- * and dispatching the data to JavaScript listeners. It robustly handles cases where the
- * app is launched from a share ("cold start") or when a share is received while the app
- * is already running ("warm start").
+ * Singleton responsible for processing share intents, extracting metadata,
+ * caching initial items, and dispatching ShareEvent objects to registered listeners.
+ *
+ * Key guarantees:
+ * - All callbacks are invoked on Dispatchers.Main (UI thread).
+ * - Cached event state is guarded by cacheLock.
+ * - Provides explicit cleanup helpers: removeListenerById, clearListeners, shutdown.
  */
 object ShareSingleton {
     private const val TAG = "ShareSingleton"
-    private val listeners = CopyOnWriteArrayList<Listener>()
-    private var cachedEventData: ShareEventData? = null
-    private var hasSentInitialItems = false
 
-    // Use SupervisorJob to prevent child failures from canceling the scope
+    private val listeners = CopyOnWriteArrayList<Listener>()
+
+    // Single cached event (cold start). Guarded by cacheLock.
+    @Volatile
+    private var cachedEventData: ShareEventData? = null
+    @Volatile
+    private var hasSentInitialItems = false
+    private val cacheLock = Any()
+
+    // Background scope for file I/O and metadata extraction
     private val processingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Main scope for dispatching callbacks to JS / UI thread
+    private val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     /**
-     * Registers a callback from JavaScript to listen for share events.
-     * This also triggers an immediate dispatch of any cached items.
+     * Register a JS callback. Returns a cleanup lambda that removes this listener.
+     *
+     * Important: This returns a Kotlin lambda that removes the listener by id.
+     * The caller (Nitro bridge) may keep that lambda on Kotlin side or JS side;
+     * be careful with returning it to JS in contexts that caused issues previously.
      */
     fun addListener(callback: (event: ShareEvent) -> Unit): () -> Unit {
         val id = UUID.randomUUID().toString()
 
-        // Wrap callback to handle exceptions safely
         val safeCallback: (event: ShareEvent) -> Unit = { event ->
             try {
                 callback(event)
@@ -50,32 +63,68 @@ object ShareSingleton {
         listeners.add(Listener(id, safeCallback))
         Log.d(TAG, "Listener added. Total listeners: ${listeners.size}")
 
-        // If there are cached items from a cold start, dispatch them now.
-        cachedEventData?.let { data ->
-            Log.d(TAG, "Found cached items. Dispatching to new listener.")
-            try {
+        // If there's cached data from a cold start, dispatch it to the new listener on Main.
+        synchronized(cacheLock) {
+            cachedEventData?.let { data ->
                 val eventType = if (!hasSentInitialItems) ShareEventType.INITIAL_SHARED_ITEMS else ShareEventType.SHARED_ITEMS
                 val event = ShareEvent(eventType, data)
-                safeCallback(event)
-                cachedEventData = null // Clear cache after dispatching
+                mainScope.launch {
+                    try {
+                        safeCallback(event)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error dispatching cached event: ${e.message}", e)
+                    }
+                }
+                cachedEventData = null
                 if (!hasSentInitialItems) hasSentInitialItems = true
-            } catch (e: Exception) {
-                Log.e(TAG, "Error dispatching cached event: ${e.message}", e)
             }
         }
 
         return {
-            listeners.removeAll { it.id == id }
-            Log.d(TAG, "Listener removed. Total listeners: ${listeners.size}")
+            removeListenerById(id)
         }
     }
 
+    private fun removeListenerById(id: String) {
+        val removed = listeners.removeAll { it.id == id }
+        if (removed) {
+            Log.d(TAG, "Listener removed (id=$id). Total listeners: ${listeners.size}")
+        }
+    }
+
+    fun clearListeners() {
+        listeners.clear()
+        Log.d(TAG, "All listeners cleared.")
+    }
+
     /**
-     * The main entry point for processing a share Intent. This is called by MainActivity.
-     * It launches a background coroutine to handle all file I/O and metadata extraction.
+     * Cancel background processing and clear listeners/cache.
+     * Call this from your app lifecycle (e.g., when module is being unloaded) if needed.
+     */
+    fun shutdown() {
+        try {
+            processingScope.cancel("ShareSingleton shutdown")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cancelling processingScope: ${e.message}")
+        }
+        try {
+            mainScope.cancel()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cancelling mainScope: ${e.message}")
+        }
+        clearListeners()
+        synchronized(cacheLock) {
+            cachedEventData = null
+            hasSentInitialItems = false
+        }
+        Log.d(TAG, "ShareSingleton shutdown complete.")
+    }
+
+    /**
+     * Main entry point for processing a share Intent. Called by MainActivity.
+     * All heavy work runs on the IO dispatcher; final dispatch happens on Main.
      */
     fun handleIntent(intent: Intent, context: Context) {
-        // Use the processing scope instead of GlobalScope
         processingScope.launch {
             try {
                 val sharedItems = mutableListOf<SharedItem>()
@@ -113,31 +162,34 @@ object ShareSingleton {
 
     private suspend fun dispatchOrCache(data: ShareEventData) = withContext(Dispatchers.Main) {
         try {
-            // If listeners are already present (app is active), dispatch immediately.
-            if (listeners.isNotEmpty()) {
-                val eventType = if (!hasSentInitialItems) ShareEventType.INITIAL_SHARED_ITEMS else ShareEventType.SHARED_ITEMS
-                val event = ShareEvent(eventType, data)
-                Log.d(TAG, "Listeners are active. Dispatching '${eventType.name}' event.")
+            synchronized(cacheLock) {
+                if (listeners.isNotEmpty()) {
+                    val eventType = if (!hasSentInitialItems) ShareEventType.INITIAL_SHARED_ITEMS else ShareEventType.SHARED_ITEMS
+                    val event = ShareEvent(eventType, data)
+                    Log.d(TAG, "Listeners are active. Dispatching '${eventType.name}' event.")
 
-                // Create a copy of listeners to avoid concurrent modification
-                val currentListeners = listeners.toList()
-                currentListeners.forEach { listener ->
-                    try {
-                        listener.callback(event)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error calling listener ${listener.id}: ${e.message}", e)
+                    // Copy listeners to avoid concurrent modifications while invoking.
+                    val currentListeners = listeners.toList()
+                    currentListeners.forEach { listener ->
+                        try {
+                            listener.callback(event)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error calling listener ${listener.id}: ${e.message}", e)
+                        }
                     }
+
+                    if (!hasSentInitialItems) hasSentInitialItems = true
+                } else {
+                    Log.d(TAG, "No active listeners. Caching items.")
+                    cachedEventData = data
                 }
-                if (!hasSentInitialItems) hasSentInitialItems = true
-            } else {
-                // Otherwise, cache the data until a listener is added.
-                Log.d(TAG, "No active listeners. Caching items.")
-                cachedEventData = data
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error dispatching or caching data: ${e.message}", e)
         }
     }
+
+    // --- Below: processing helpers (unchanged logic, safe I/O on IO dispatcher) ---
 
     private suspend fun processItem(intent: Intent, context: Context): SharedItem? = withContext(Dispatchers.IO) {
         try {
@@ -190,8 +242,7 @@ object ShareSingleton {
 
     private suspend fun processMultipleItems(intent: Intent, context: Context): List<SharedItem> = withContext(Dispatchers.IO) {
         try {
-            val uris = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
-                ?: return@withContext emptyList()
+            val uris = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM) ?: return@withContext emptyList()
 
             val sourceApp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                 try {
@@ -223,15 +274,15 @@ object ShareSingleton {
             var displayName: String? = null
             var size: Long? = null
 
-            // Safely query content resolver
             try {
                 contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                     if (cursor.moveToFirst()) {
-                        cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it != -1 }?.let { i ->
-                            displayName = cursor.getString(i)
-                        }
-                        cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it != -1 && !cursor.isNull(it) }?.let { i ->
-                            size = cursor.getLong(i)
+                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx != -1) displayName = cursor.getString(nameIdx)
+
+                        val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
+                            size = cursor.getLong(sizeIdx)
                         }
                     }
                 }
@@ -239,7 +290,6 @@ object ShareSingleton {
                 Log.w(TAG, "Could not query content resolver for URI $uri: ${e.message}")
             }
 
-            // Create temp file safely
             val tempFile = File(context.cacheDir, displayName ?: "shared_${UUID.randomUUID()}")
             try {
                 contentResolver.openInputStream(uri)?.use { input ->
@@ -264,7 +314,6 @@ object ShareSingleton {
             var height: Double? = null
             var thumbnailPath: String? = null
 
-            // Extract metadata safely for media files
             if (itemType == ShareItemType.VIDEO || itemType == ShareItemType.IMAGE) {
                 extractMediaMetadata(tempFile, context)?.let { metadata ->
                     duration = metadata.duration
@@ -334,7 +383,7 @@ object ShareSingleton {
             }
 
             val thumbnailPath = try {
-                val frame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val frame: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     retriever.getFrameAtIndex(0)
                 } else {
                     retriever.getFrameAtTime(1000)

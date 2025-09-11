@@ -84,5 +84,6 @@ export interface NitroShareReceiver
    * @param callback The function to call with the share event.
    * @returns A function that, when called, will unsubscribe the listener.
    */
-  addShareListener(callback: (event: ShareEvent) => void): () => void;
+  addShareListener(callback: (event: ShareEvent) => void): void;
+  removeListener(): void;
 }
