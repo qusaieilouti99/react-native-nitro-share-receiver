@@ -1,6 +1,6 @@
 {
   "name": "react-native-nitro-share-receiver",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Put your app as receiving share target",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
@@ -83,12 +83,12 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-native": "^5.0.0",
     "jest": "^29.7.0",
-    "nitrogen": "^0.29.4",
+    "nitrogen": "0.31.5",
     "prettier": "^3.0.3",
     "react": "19.1.0",
     "react-native": "0.81.0",
     "react-native-builder-bob": "^0.40.13",
-    "react-native-nitro-modules": "^0.29.4",
+    "react-native-nitro-modules": "0.31.5",
     "release-it": "^17.10.0",
     "turbo": "^1.10.7",
     "typescript": "^5.8.3"
@@ -96,7 +96,7 @@
   "peerDependencies": {
     "react": "*",
     "react-native": "*",
-    "react-native-nitro-modules": "^0.29.4"
+    "react-native-nitro-modules": "*"
   },
   "workspaces": [
     "example"
